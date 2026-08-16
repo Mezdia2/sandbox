@@ -1,0 +1,6 @@
+{
+  "name": "sandbox",
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "onCreateCommand": "bash .devcontainer/keepalive.sh start",
+  "postStartCommand": "bash .devcontainer/keepalive.sh start"
+}
