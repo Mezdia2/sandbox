@@ -20,15 +20,33 @@
 #      file and running `keepalive.sh start` re-enables it.
 set -u
 
-LOG="${KEEPALIVE_LOG:-/tmp/codespace-keepalive.log}"
-PIDFILE="${KEEPALIVE_PIDFILE:-/tmp/codespace-keepalive.pid}"
+STATE_DIR="${KEEPALIVE_STATE_DIR:-$HOME/.cache/codespace-keepalive}"
+LOG="$STATE_DIR/keepalive.log"
+PIDFILE="$STATE_DIR/keepalive.pid"
 MARKER="$HOME/.codespace-keepalive.disabled"
 GH_DISABLE_PATH=".devcontainer/keepalive.disabled"
 CS="${CODESPACE_NAME:-}"
 
+mkdir -p "$STATE_DIR"
+
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG"; }
 
-running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+watch_pids() { pgrep -f 'keepalive\.sh watchdog' 2>/dev/null; }
+
+running() {
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  [ -n "$(watch_pids)" ]
+}
+
+current_pid() {
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    cat "$PIDFILE"
+  else
+    watch_pids | head -n1
+  fi
+}
 
 repo_slug() {
   local url
@@ -91,7 +109,7 @@ run() {
 
 start() {
   if running; then
-    echo "keep-alive already running (pid $(cat "$PIDFILE"))"
+    echo "keep-alive already running (pid $(current_pid))"
     return 0
   fi
   if disabled; then
@@ -101,7 +119,7 @@ start() {
   setsid nohup bash "$0" watchdog >/dev/null 2>&1 &
   sleep 1
   if running; then
-    echo "keep-alive started (pid $(cat "$PIDFILE"))"
+    echo "keep-alive started (pid $(current_pid))"
   else
     echo "keep-alive failed to start; see $LOG"
     return 1
@@ -109,9 +127,9 @@ start() {
 }
 
 stop() {
-  if running; then
-    local pid
-    pid="$(cat "$PIDFILE")"
+  local pid
+  pid="$(current_pid)"
+  if [ -n "$pid" ]; then
     kill "$pid" 2>/dev/null && echo "stopped pid $pid"
     rm -f "$PIDFILE"
     return 0
@@ -121,8 +139,10 @@ stop() {
 }
 
 status() {
-  if running; then
-    echo "running (pid $(cat "$PIDFILE"))"
+  local pid
+  pid="$(current_pid)"
+  if [ -n "$pid" ]; then
+    echo "running (pid $pid)"
     return 0
   fi
   echo "not running"
