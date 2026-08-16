@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-# codespace-keepalive
-# Prevents a GitHub Codespace from auto-stopping due to inactivity.
+# codespace-keepalive  — keep a GitHub Codespace alive past its idle timeout.
 #
-# Mechanism: every ~3 minutes it opens an SSH session to this codespace via
-# GitHub's gateway and emits terminal output. GitHub's docs define terminal
-# activity (input or output) as activity that resets the idle timeout, so the
-# codespace never reaches its idle timeout.
+# GitHub stops a codespace after ~30 minutes of inactivity, and closing the
+# browser tab does not stop that clock. Per GitHub's docs, terminal activity
+# (input or output) on the codespace resets the idle timeout, so this script
+# keeps opening an SSH session into its own codespace through GitHub's gateway
+# and emits terminal output on a fixed schedule. The codespace therefore never
+# goes idle and keeps running even with no client connected.
+#
+# Architecture: a "supervise" guard (session leader, owns the pidfile) which
+# restarts the "worker" if it dies, plus the "worker" that runs the SSH cycles.
 #
 # Usage:
-#   keepalive.sh start   Start the keep-alive (idempotent). Runs automatically
-#                        at codespace creation/start via .devcontainer/devcontainer.json.
-#   keepalive.sh stop    Stop the keep-alive for the current codespace.
-#   keepalive.sh status  Show whether the keep-alive is running.
+#   keepalive.sh start    Start (idempotent). Auto-run at codespace
+#                         create/start via .devcontainer/devcontainer.json.
+#   keepalive.sh stop     Stop completely (kills the whole process group).
+#   keepalive.sh status   Show state and last activity.
 #
-# Disable it (until re-enabled) via either:
-#   1. Terminal:  touch ~/.codespace-keepalive.disabled
-#   2. GitHub web: create a file named  .devcontainer/keepalive.disabled
-#      in the repository (the script polls it via the GitHub API). Deleting the
-#      file and running `keepalive.sh start` re-enables it.
+# Disable (until re-enabled) via either:
+#   1. Terminal: touch ~/.codespace-keepalive.disabled
+#   2. GitHub web: create the file .devcontainer/keepalive.disabled in the
+#      repository (polled via the GitHub API). Re-enable: delete the file,
+#      then run `keepalive.sh start`.
 set -u
 
 STATE_DIR="${KEEPALIVE_STATE_DIR:-$HOME/.cache/codespace-keepalive}"
@@ -25,27 +29,41 @@ LOG="$STATE_DIR/keepalive.log"
 PIDFILE="$STATE_DIR/keepalive.pid"
 MARKER="$HOME/.codespace-keepalive.disabled"
 GH_DISABLE_PATH=".devcontainer/keepalive.disabled"
+WORKTREE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo)"
 CS="${CODESPACE_NAME:-}"
+SSH_TIMEOUT=300
+GAP_SLEEP=45
+CHECK_INTERVAL=60
+OUT_CHANNEL='echo ka-connect-$(date -u +%H:%M:%SZ); sleep 150; echo ka-alive-$(date -u +%H:%M:%SZ)'
 
 mkdir -p "$STATE_DIR"
 
-log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG"; }
+log() {
+  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG"
+  if [ "$(wc -c <"$LOG")" -gt 5242880 ]; then
+    tail -n 500 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+  fi
+}
 
-watch_pids() { pgrep -f 'keepalive\.sh watchdog' 2>/dev/null; }
+pid_is_ours() {
+  local p="${1:-}"
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  ps -o cmd= -p "$p" 2>/dev/null | grep -q 'keepalive\.sh' || return 1
+}
+
+watch_pids() { pgrep -f 'keepalive\.sh (supervise|worker|watchdog)' 2>/dev/null; }
 
 running() {
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    return 0
-  fi
+  pid_is_ours "$(cat "$PIDFILE" 2>/dev/null)" && return 0
   [ -n "$(watch_pids)" ]
 }
 
 current_pid() {
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    cat "$PIDFILE"
-  else
-    watch_pids | head -n1
-  fi
+  local p
+  p="$(cat "$PIDFILE" 2>/dev/null)"
+  pid_is_ours "$p" && { printf '%s' "$p"; return 0; }
+  watch_pids | head -n1
 }
 
 repo_slug() {
@@ -59,7 +77,9 @@ repo_slug() {
   esac
 }
 
-disabled_local() { [ -f "$MARKER" ]; }
+disabled_local() {
+  [ -f "$MARKER" ] || { [ -n "$WORKTREE_ROOT" ] && [ -f "$WORKTREE_ROOT/$GH_DISABLE_PATH" ]; }
+}
 
 disabled_github() {
   local slug
@@ -68,19 +88,31 @@ disabled_github() {
   timeout 10 gh api "repos/$slug/contents/$GH_DISABLE_PATH" --jq '.name' >/dev/null 2>&1
 }
 
-disabled() {
-  if disabled_local; then
-    log "disabled by marker: $MARKER"
-    return 0
-  fi
-  if disabled_github; then
-    log "disabled by GitHub file: $GH_DISABLE_PATH"
-    return 0
-  fi
-  return 1
+worker() {
+  local fails=0 skip=0
+  while :; do
+    if [ -f "$MARKER" ]; then
+      log "disabled by marker: $MARKER"
+      exit 0
+    fi
+    if timeout "$SSH_TIMEOUT" gh cs ssh -c "$CS" -- "$OUT_CHANNEL" >>"$LOG" 2>&1; then
+      fails=0
+    else
+      fails=$((fails + 1))
+      log "SSH session failed (attempt $fails)"
+      sleep 30
+    fi
+    if [ "$fails" -ge 5 ]; then
+      log "5 consecutive SSH failures, backing off 5 min"
+      sleep 300
+      fails=0
+      continue
+    fi
+    sleep "$GAP_SLEEP"
+  done
 }
 
-run() {
+supervise() {
   trap 'rm -f "$PIDFILE"; exit 0' INT TERM
   echo "$$" >"$PIDFILE"
   if [ -z "$CS" ]; then
@@ -89,22 +121,32 @@ run() {
     exit 0
   fi
   log "keep-alive started pid=$$ codespace=$CS"
-  while true; do
-    if disabled; then
-      log "keep-alive disabled, exiting"
+  local worker_pid="" i=0
+  while :; do
+    if [ -n "$worker_pid" ] && ! kill -0 "$worker_pid" 2>/dev/null; then
+      log "worker $worker_pid died; restarting"
+      worker_pid=""
+    fi
+    if [ -z "$worker_pid" ]; then
+      bash "$0" worker >>"$LOG" 2>&1 &
+      worker_pid=$!
+      disown "$worker_pid" 2>/dev/null ||:
+    fi
+    i=$((i + 1))
+    if [ -f "$MARKER" ] || { [ -n "$WORKTREE_ROOT" ] && [ -f "$WORKTREE_ROOT/$GH_DISABLE_PATH" ]; }; then
+      log "disabled by marker: $MARKER"
+      [ -n "$worker_pid" ] && kill "$worker_pid" 2>/dev/null
       break
     fi
-    if timeout 300 gh cs ssh -c "$CS" -- \
-      'echo ka-connect-$(date -u +%H:%M:%SZ); sleep 150; echo ka-alive-$(date -u +%H:%M:%SZ)' \
-      >>"$LOG" 2>&1; then
-      :
-    else
-      log "ssh session failed, retrying in 30s"
-      sleep 30
+    if [ $((i % 6)) -eq 0 ] && disabled_github; then
+      log "disabled by GitHub file: $GH_DISABLE_PATH"
+      [ -n "$worker_pid" ] && kill "$worker_pid" 2>/dev/null
+      break
     fi
-    sleep 45
+    sleep "$CHECK_INTERVAL"
   done
   rm -f "$PIDFILE"
+  exit 0
 }
 
 start() {
@@ -112,11 +154,11 @@ start() {
     echo "keep-alive already running (pid $(current_pid))"
     return 0
   fi
-  if disabled; then
+  if disabled_local || disabled_github; then
     echo "keep-alive is disabled (remove $MARKER or $GH_DISABLE_PATH on GitHub, then retry)"
     return 1
   fi
-  setsid nohup bash "$0" watchdog >/dev/null 2>&1 &
+  setsid nohup bash "$0" supervise >/dev/null 2>&1 &
   sleep 1
   if running; then
     echo "keep-alive started (pid $(current_pid))"
@@ -127,33 +169,53 @@ start() {
 }
 
 stop() {
-  local pid
+  local pid pgid t
   pid="$(current_pid)"
-  if [ -n "$pid" ]; then
-    kill "$pid" 2>/dev/null && echo "stopped pid $pid"
-    rm -f "$PIDFILE"
-    return 0
+  if [ -z "$pid" ]; then
+    echo "keep-alive not running"
+    return 1
   fi
-  echo "keep-alive not running"
-  return 1
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  log "stopping keep-alive pid=$pid pgid=$pgid"
+  if [ -n "$pgid" ] && [ "$pgid" -gt 1 ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null
+  fi
+  kill "$pid" 2>/dev/null
+  t=0
+  while [ "$t" -lt 8 ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.5
+    t=$((t + 1))
+  done
+  if [ "$t" -ge 8 ] && kill -0 "$pid" 2>/dev/null; then
+    log "force killing keep-alive pid=$pid"
+    kill -KILL -- "-$pgid" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$PIDFILE"
+  echo "stopped keep-alive (pid $pid)"
+  return 0
 }
 
 status() {
-  local pid
+  local pid last
   pid="$(current_pid)"
-  if [ -n "$pid" ]; then
-    echo "running (pid $pid)"
-    return 0
+  if [ -z "$pid" ]; then
+    echo "not running"
+    return 1
   fi
-  echo "not running"
-  return 1
+  echo "running (pid $pid)"
+  last="$(grep -E 'ka-(connect|alive)' "$LOG" 2>/dev/null | tail -n1)"
+  [ -n "$last" ] && echo "last activity: $last"
+  echo "log: $LOG"
+  return 0
 }
 
 case "${1:-}" in
   start) start ;;
   stop) stop ;;
   status) status ;;
-  watchdog) run ;;
+  supervise) supervise ;;
+  worker|watchdog) worker ;;
   *)
     echo "usage: $0 {start|stop|status}"
     exit 2
