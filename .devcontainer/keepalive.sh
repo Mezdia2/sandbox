@@ -76,7 +76,7 @@ run() {
       log "keep-alive disabled, exiting"
       break
     fi
-    if gh cs ssh -c "$CS" -- \
+    if timeout 300 gh cs ssh -c "$CS" -- \
       'echo ka-connect-$(date -u +%H:%M:%SZ); sleep 150; echo ka-alive-$(date -u +%H:%M:%SZ)' \
       >>"$LOG" 2>&1; then
       :
